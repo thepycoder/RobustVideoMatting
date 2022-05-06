@@ -41,23 +41,25 @@ class CV2Reader(Thread):
 
     def run(self) -> None:
         while not self.completed:
-            batch = []
-            for _ in range(self.batch_size):
+            start = time.time()
+            read_time = []
+            frame_batch = np.zeros((self.batch_size, 3, 2160, 3840))
+            for i in range(self.batch_size):
                 ret, frame = self.cap.read()
                 if ret:
-                    batch.append(np.transpose(frame[..., ::-1], axes=[2, 0, 1]) / 255)
+                    frame = frame[..., ::-1]
+                    frame = np.transpose(frame, axes=[2, 0, 1])
+                    start_read = time.time()
+                    frame = frame / 255  # Half of the function time is spent here
+                    read_time.append(time.time() - start_read)
+                    frame_batch[i, ...] = frame  # Half of the function time is spent here
                 else:
-                    if batch:
-                        # If no new frames, just repeat the last frame
-                        batch.append(batch[-1])
-                    else:
-                        self.frame_queue.put((True, None))
-                        self.completed = True
-                        return
                     self.completed = True
 
-            frame_batch = np.stack(batch)
             self.frame_queue.put((self.completed, torch.from_numpy(frame_batch)))
+            print(sum(read_time))
+            print(time.time() - start)
+            print(sum(read_time) / (time.time() - start))
 
 # @profile
 def convert_video(model,
@@ -167,8 +169,6 @@ def convert_video(model,
 
     if (output_composition is not None) and (output_type == 'video'):
         bgr = torch.tensor([120, 255, 155], device=device, dtype=dtype).div(255).view(1, 1, 3, 1, 1)
-
-    time.sleep(10)
 
     try:
         with torch.no_grad():
