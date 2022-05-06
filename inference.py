@@ -11,16 +11,55 @@ python inference.py \
     --output-video-mbps 4 \
     --seq-chunk 1
 """
+import sys
+import time
+from queue import Queue
+from threading import Thread
 
+import numpy as np
 import torch
 import os
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from typing import Optional, Tuple
 from tqdm.auto import tqdm
+import cv2
 
 from inference_utils import VideoReader, VideoWriter, ImageSequenceReader, ImageSequenceWriter
 
+
+class CV2Reader(Thread):
+    def __init__(self, video_path: str, frame_queue: Queue, batch_size: int):
+        super().__init__()
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            print("Cannot open file")
+            sys.exit(1)
+        self.frame_queue = frame_queue
+        self.batch_size = batch_size
+        self.completed = False
+
+    def run(self) -> None:
+        while not self.completed:
+            batch = []
+            for _ in range(self.batch_size):
+                ret, frame = self.cap.read()
+                if ret:
+                    batch.append(np.transpose(frame[..., ::-1], axes=[2, 0, 1]) / 255)
+                else:
+                    if batch:
+                        # If no new frames, just repeat the last frame
+                        batch.append(batch[-1])
+                    else:
+                        self.frame_queue.put((True, None))
+                        self.completed = True
+                        return
+                    self.completed = True
+
+            frame_batch = np.stack(batch)
+            self.frame_queue.put((self.completed, torch.from_numpy(frame_batch)))
+
+# @profile
 def convert_video(model,
                   input_source: str,
                   input_resize: Optional[Tuple[int, int]] = None,
@@ -35,7 +74,7 @@ def convert_video(model,
                   progress: bool = True,
                   device: Optional[str] = None,
                   dtype: Optional[torch.dtype] = None):
-    
+
     """
     Args:
         input_source:A video file, or an image sequence directory. Images must be sorted in accending order, support png and jpg.
@@ -54,13 +93,13 @@ def convert_video(model,
         device: Only need to manually provide if model is a TorchScript freezed model.
         dtype: Only need to manually provide if model is a TorchScript freezed model.
     """
-    
+
     assert downsample_ratio is None or (downsample_ratio > 0 and downsample_ratio <= 1), 'Downsample ratio must be between 0 (exclusive) and 1 (inclusive).'
     assert any([output_composition, output_alpha, output_foreground]), 'Must provide at least one output.'
     assert output_type in ['video', 'png_sequence'], 'Only support "video" and "png_sequence" output modes.'
     assert seq_chunk >= 1, 'Sequence chunk must be >= 1'
     assert num_workers >= 0, 'Number of workers must be >= 0'
-    
+
     # Initialize transform
     if input_resize is not None:
         transform = transforms.Compose([
@@ -75,27 +114,42 @@ def convert_video(model,
         source = VideoReader(input_source, transform)
     else:
         source = ImageSequenceReader(input_source, transform)
-    reader = DataLoader(source, batch_size=seq_chunk, pin_memory=True, num_workers=num_workers)
-    
+    # dataload_reader = DataLoader(source, batch_size=seq_chunk, pin_memory=True)
+    frame_batch_queue = Queue(maxsize=20)
+    reader = CV2Reader(video_path=input_source, frame_queue=frame_batch_queue, batch_size=seq_chunk)
+    reader.start()
+
     # Initialize writers
     if output_type == 'video':
         frame_rate = source.frame_rate if isinstance(source, VideoReader) else 30
         output_video_mbps = 1 if output_video_mbps is None else output_video_mbps
         if output_composition is not None:
+            com_queue = Queue(maxsize=20)
             writer_com = VideoWriter(
                 path=output_composition,
                 frame_rate=frame_rate,
-                bit_rate=int(output_video_mbps * 1000000))
+                queue=com_queue,
+                bit_rate=int(output_video_mbps * 1000000)
+            )
+            writer_com.start()
         if output_alpha is not None:
+            pha_queue = Queue(maxsize=200)
             writer_pha = VideoWriter(
                 path=output_alpha,
                 frame_rate=frame_rate,
-                bit_rate=int(output_video_mbps * 1000000))
+                queue=pha_queue,
+                bit_rate=int(output_video_mbps * 1000000)
+            )
+            writer_pha.start()
         if output_foreground is not None:
+            fgr_queue = Queue(maxsize=200)
             writer_fgr = VideoWriter(
                 path=output_foreground,
                 frame_rate=frame_rate,
-                bit_rate=int(output_video_mbps * 1000000))
+                queue=fgr_queue,
+                bit_rate=int(output_video_mbps * 1000000)
+            )
+            writer_fgr.start()
     else:
         if output_composition is not None:
             writer_com = ImageSequenceWriter(output_composition, 'png')
@@ -110,15 +164,26 @@ def convert_video(model,
         param = next(model.parameters())
         dtype = param.dtype
         device = param.device
-    
+
     if (output_composition is not None) and (output_type == 'video'):
         bgr = torch.tensor([120, 255, 155], device=device, dtype=dtype).div(255).view(1, 1, 3, 1, 1)
-    
+
+    time.sleep(10)
+
     try:
         with torch.no_grad():
             bar = tqdm(total=len(source), disable=not progress, dynamic_ncols=True)
             rec = [None] * 4
-            for src in reader:
+            completed = False
+            # for src in reader:
+            while not completed:
+
+                print(frame_batch_queue.qsize())
+                completed, src = frame_batch_queue.get()
+                # dataload_batch = next(iter(dataload_reader))
+
+                if completed and src is None:
+                    break
 
                 if downsample_ratio is None:
                     downsample_ratio = auto_downsample_ratio(*src.shape[2:])
@@ -127,27 +192,38 @@ def convert_video(model,
                 fgr, pha, *rec = model(src, *rec, downsample_ratio)
 
                 if output_foreground is not None:
-                    writer_fgr.write(fgr[0])
+                    fgr_queue.put(fgr[0])
+                    # print(f"fgr_queue: {fgr_queue.qsize()}")
+                    # writer_fgr.write(fgr[0])
                 if output_alpha is not None:
-                    writer_pha.write(pha[0])
+                    pha_queue.put(pha[0])
+                    # print(f"pha_queue: {pha_queue.qsize()}")
+                    # writer_pha.write(pha[0])
                 if output_composition is not None:
                     if output_type == 'video':
                         com = fgr * pha + bgr * (1 - pha)
                     else:
                         fgr = fgr * pha.gt(0)
                         com = torch.cat([fgr, pha], dim=-3)
-                    writer_com.write(com[0])
-                
+                    # writer_com.write(com[0])
+                    # print(f"com_queue: {com_queue.qsize()}")
+                    com_queue.put(com[0])
+
                 bar.update(src.size(1))
+                frame_batch_queue.task_done()
 
     finally:
+        print("Cleaning up!")
         # Clean up
         if output_composition is not None:
-            writer_com.close()
+            writer_com.running = False
+            writer_com.join()
         if output_alpha is not None:
-            writer_pha.close()
+            writer_pha.running = False
+            writer_pha.join()
         if output_foreground is not None:
-            writer_fgr.close()
+            writer_fgr.running = False
+            writer_fgr.join()
 
 
 def auto_downsample_ratio(h, w):
@@ -164,14 +240,14 @@ class Converter:
         self.model = torch.jit.script(self.model)
         self.model = torch.jit.freeze(self.model)
         self.device = device
-    
+
     def convert(self, *args, **kwargs):
         convert_video(self.model, device=self.device, dtype=torch.float32, *args, **kwargs)
-    
+
 if __name__ == '__main__':
     import argparse
     from model import MattingNetwork
-    
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--variant', type=str, required=True, choices=['mobilenetv3', 'resnet50'])
     parser.add_argument('--checkpoint', type=str, required=True)
@@ -188,7 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--disable-progress', action='store_true')
     args = parser.parse_args()
-    
+
     converter = Converter(args.variant, args.checkpoint, args.device)
     converter.convert(
         input_source=args.input_source,
@@ -203,5 +279,5 @@ if __name__ == '__main__':
         num_workers=args.num_workers,
         progress=not args.disable_progress
     )
-    
-    
+
+

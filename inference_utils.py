@@ -1,3 +1,5 @@
+from threading import Thread
+
 import av
 import os
 import pims
@@ -28,12 +30,23 @@ class VideoReader(Dataset):
         return frame
 
 
-class VideoWriter:
-    def __init__(self, path, frame_rate, bit_rate=1000000):
+class VideoWriter(Thread):
+    def __init__(self, path, frame_rate, queue, bit_rate=1000000):
+        super().__init__()
         self.container = av.open(path, mode='w')
         self.stream = self.container.add_stream('h264', rate=round(frame_rate))
         self.stream.pix_fmt = 'yuv420p'
         self.stream.bit_rate = bit_rate
+        self.queue = queue
+        self.running = False
+
+    def run(self):
+        self.running = True
+        while self.running:
+            frames = self.queue.get()
+            self.write(frames)
+            self.queue.task_done()
+        self.close()
     
     def write(self, frames):
         # frames: [T, C, H, W]
